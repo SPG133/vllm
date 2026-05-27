@@ -141,10 +141,10 @@ class Request:
         self.num_output_placeholders = 0
         self.async_tokens_to_discard = 0
 
-        # Scheduler-side timing. local_execution_time tracks wall-clock time
-        # spent in this vLLM instance's scheduled model execution steps.
-        # remote_execution_time is carried through P/D kv_transfer_params.
-        # actual_execution_time is finalized as local + remote execution time.
+        # 调度器侧的请求计时。
+        # local_execution_time：当前 vLLM 实例上实际执行模型 forward 的累计时间。
+        # remote_execution_time：PD 分离时由 P 端通过 kv_transfer_params 传来的执行时间。
+        # actual_execution_time：最终统计为 P 端执行时间 + D 端执行时间。
         self.scheduler_enqueue_time = time.monotonic()
         self.local_execution_time = 0.0
         self.remote_execution_time = self._get_remote_execution_time()
@@ -297,6 +297,8 @@ class Request:
         self.events.append(EngineCoreEvent.new_event(event_type, timestamp))
 
     def record_scheduler_enqueue(self, timestamp: float | None = None) -> None:
+        # 请求进入 scheduler 队列时重置本实例计时；如果是 D 端请求，
+        # remote_execution_time 会从 P 端传来的 kv_transfer_params 中恢复。
         self.scheduler_enqueue_time = (
             timestamp if timestamp is not None else time.monotonic()
         )
@@ -307,11 +309,13 @@ class Request:
         self._execution_start_times.clear()
 
     def record_execution_start(self, timestamp: float | None = None) -> None:
+        # 记录一次调度步真正交给 model runner 执行的开始时间。
         self._execution_start_times.append(
             timestamp if timestamp is not None else time.monotonic()
         )
 
     def record_execution_end(self, timestamp: float | None = None) -> None:
+        # model runner 返回后，累加本实例实际执行时间。
         if not self._execution_start_times:
             return
         end_time = timestamp if timestamp is not None else time.monotonic()
@@ -322,6 +326,7 @@ class Request:
         )
 
     def finalize_scheduler_timing(self, timestamp: float | None = None) -> None:
+        # 请求结束时结算：执行时间为 P 段 + D 段，等待时间为总驻留时间减执行时间。
         end_time = timestamp if timestamp is not None else time.monotonic()
         while self._execution_start_times:
             self.record_execution_end(end_time)
@@ -333,6 +338,7 @@ class Request:
         self.waiting_time = max(0.0, total_time - self.actual_execution_time)
 
     def _get_remote_execution_time(self) -> float:
+        # PD 分离下，D 端 request 会携带 P 端已经花掉的执行时间。
         if not self.kv_transfer_params:
             return 0.0
         return float(self.kv_transfer_params.get("remote_execution_time", 0.0))

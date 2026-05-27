@@ -671,5 +671,7 @@ class NixlConnectorScheduler:
             remote_port=self.side_channel_port,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_num_tokens=remote_num_tokens,
+            # PD 分离下把当前端累计执行时间传给下一端；
+            # D 端会把它作为 remote_execution_time 加到本地执行时间上。
             remote_execution_time=request.actual_execution_time,
         )

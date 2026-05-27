@@ -961,6 +961,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            # 本轮被调度后，记录实际进入模型执行阶段的开始时间。
             request.record_execution_start()
             request.num_computed_tokens += num_scheduled_token
             request.is_prefill_chunk = request.num_computed_tokens < (
@@ -1345,6 +1346,7 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        # 统一使用同一个结束时间，避免同一批请求因循环顺序产生统计偏差。
         execution_end_time = time.monotonic()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
@@ -1359,6 +1361,7 @@ class Scheduler(SchedulerInterface):
                 # In this case, we use is_finished() to check.
                 continue
 
+            # model runner 已返回，结算本轮在当前实例上的实际执行时间。
             request.record_execution_end(execution_end_time)
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
@@ -1830,6 +1833,7 @@ class Scheduler(SchedulerInterface):
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
 
         # Second pass: set status and free requests
+        # 外部 abort/finish 路径也需要结算等待时间和执行时间。
         finished_timestamp = time.monotonic()
         for request in valid_requests:
             delay_free_blocks = False
@@ -1851,6 +1855,7 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        # 请求真正释放前最终结算：waiting_time = scheduler 驻留时间 - 实际执行时间。
         request.finalize_scheduler_timing()
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
