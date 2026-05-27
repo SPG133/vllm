@@ -763,6 +763,8 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    # D 端开始等待 P 端 KV 传输；传输时间单独统计。
+                    request.record_kv_transfer_start()
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
@@ -2098,6 +2100,8 @@ class Scheduler(SchedulerInterface):
         assert self.connector is not None
 
         if request.request_id in self.failed_recving_kv_req_ids:
+            # 远端 KV 传输失败也要结束本次传输计时，避免请求结束时重复计入。
+            request.record_kv_transfer_end()
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
             if request.num_computed_tokens:
@@ -2110,6 +2114,8 @@ class Scheduler(SchedulerInterface):
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
+            # 远端 KV 已经可用，结束 D 端等待 KV 的传输计时。
+            request.record_kv_transfer_end()
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)

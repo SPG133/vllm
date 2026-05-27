@@ -142,15 +142,20 @@ class Request:
         self.async_tokens_to_discard = 0
 
         # 调度器侧的请求计时。
-        # local_execution_time：当前 vLLM 实例上实际执行模型 forward 的累计时间。
-        # remote_execution_time：PD 分离时由 P 端通过 kv_transfer_params 传来的执行时间。
-        # actual_execution_time：最终统计为 P 端执行时间 + D 端执行时间。
+        # prefill_execution_time：P 端模型 forward 累计时间。
+        # decode_execution_time：D 端模型 forward 累计时间。
+        # kv_transfer_time：P/D 之间 KV 传输等待时间，单独记录，不混入模型执行时间。
+        # actual_execution_time：按当前实验定义统计为 P 端执行时间 + D 端执行时间。
         self.scheduler_enqueue_time = time.monotonic()
-        self.local_execution_time = 0.0
-        self.remote_execution_time = self._get_remote_execution_time()
-        self.actual_execution_time = self.remote_execution_time
+        self.prefill_execution_time = self._get_prefill_execution_time()
+        self.decode_execution_time = self._get_decode_execution_time()
+        self.kv_transfer_time = self._get_kv_transfer_time()
+        self.actual_execution_time = (
+            self.prefill_execution_time + self.decode_execution_time
+        )
         self.waiting_time = 0.0
         self._execution_start_times: deque[float] = deque()
+        self._kv_transfer_start_time: float | None = None
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
@@ -298,15 +303,19 @@ class Request:
 
     def record_scheduler_enqueue(self, timestamp: float | None = None) -> None:
         # 请求进入 scheduler 队列时重置本实例计时；如果是 D 端请求，
-        # remote_execution_time 会从 P 端传来的 kv_transfer_params 中恢复。
+        # prefill_execution_time 会从 P 端传来的 kv_transfer_params 中恢复。
         self.scheduler_enqueue_time = (
             timestamp if timestamp is not None else time.monotonic()
         )
-        self.local_execution_time = 0.0
-        self.remote_execution_time = self._get_remote_execution_time()
-        self.actual_execution_time = self.remote_execution_time
+        self.prefill_execution_time = self._get_prefill_execution_time()
+        self.decode_execution_time = self._get_decode_execution_time()
+        self.kv_transfer_time = self._get_kv_transfer_time()
+        self.actual_execution_time = (
+            self.prefill_execution_time + self.decode_execution_time
+        )
         self.waiting_time = 0.0
         self._execution_start_times.clear()
+        self._kv_transfer_start_time = None
 
     def record_execution_start(self, timestamp: float | None = None) -> None:
         # 记录一次调度步真正交给 model runner 执行的开始时间。
@@ -320,28 +329,77 @@ class Request:
             return
         end_time = timestamp if timestamp is not None else time.monotonic()
         start_time = self._execution_start_times.popleft()
-        self.local_execution_time += max(0.0, end_time - start_time)
+        elapsed = max(0.0, end_time - start_time)
+        if self._is_pd_decode_request():
+            self.decode_execution_time += elapsed
+        else:
+            self.prefill_execution_time += elapsed
         self.actual_execution_time = (
-            self.remote_execution_time + self.local_execution_time
+            self.prefill_execution_time + self.decode_execution_time
         )
 
+    def record_kv_transfer_start(self, timestamp: float | None = None) -> None:
+        # D 端开始等待 P 端 KV 传输时记录起点。
+        self._kv_transfer_start_time = (
+            timestamp if timestamp is not None else time.monotonic()
+        )
+
+    def record_kv_transfer_end(self, timestamp: float | None = None) -> None:
+        # D 端收到远端 KV 后，单独累计传输等待时间。
+        if self._kv_transfer_start_time is None:
+            return
+        end_time = timestamp if timestamp is not None else time.monotonic()
+        self.kv_transfer_time += max(0.0, end_time - self._kv_transfer_start_time)
+        self._kv_transfer_start_time = None
+
     def finalize_scheduler_timing(self, timestamp: float | None = None) -> None:
-        # 请求结束时结算：执行时间为 P 段 + D 段，等待时间为总驻留时间减执行时间。
+        # 请求结束时结算：执行时间为 P 段 + D 段；
+        # KV 传输时间单独保存在 kv_transfer_time，不计入 actual_execution_time。
         end_time = timestamp if timestamp is not None else time.monotonic()
         while self._execution_start_times:
             self.record_execution_end(end_time)
-        self.remote_execution_time = self._get_remote_execution_time()
+        if self._kv_transfer_start_time is not None:
+            self.record_kv_transfer_end(end_time)
+        self.prefill_execution_time = max(
+            self.prefill_execution_time, self._get_prefill_execution_time()
+        )
+        self.decode_execution_time = max(
+            self.decode_execution_time, self._get_decode_execution_time()
+        )
+        self.kv_transfer_time = max(
+            self.kv_transfer_time, self._get_kv_transfer_time()
+        )
         self.actual_execution_time = (
-            self.remote_execution_time + self.local_execution_time
+            self.prefill_execution_time + self.decode_execution_time
         )
         total_time = max(0.0, end_time - self.scheduler_enqueue_time)
         self.waiting_time = max(0.0, total_time - self.actual_execution_time)
 
-    def _get_remote_execution_time(self) -> float:
+    def _get_prefill_execution_time(self) -> float:
         # PD 分离下，D 端 request 会携带 P 端已经花掉的执行时间。
         if not self.kv_transfer_params:
             return 0.0
-        return float(self.kv_transfer_params.get("remote_execution_time", 0.0))
+        return float(self.kv_transfer_params.get("prefill_execution_time", 0.0))
+
+    def _get_decode_execution_time(self) -> float:
+        if not self.kv_transfer_params:
+            return 0.0
+        return float(self.kv_transfer_params.get("decode_execution_time", 0.0))
+
+    def _get_kv_transfer_time(self) -> float:
+        if not self.kv_transfer_params:
+            return 0.0
+        return float(self.kv_transfer_params.get("kv_transfer_time", 0.0))
+
+    def _is_pd_decode_request(self) -> bool:
+        params = self.kv_transfer_params
+        # NIXL 在 D 端发起 KV 拉取后会消费 do_remote_prefill 标志，
+        # 因此这里用 remote_block_ids 判断该请求是否来自 PD 的 D 端。
+        return bool(
+            params
+            and not params.get("do_remote_decode")
+            and "remote_block_ids" in params
+        )
 
     def take_events(self) -> list[EngineCoreEvent] | None:
         if not self.events:
