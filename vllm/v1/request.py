@@ -141,6 +141,17 @@ class Request:
         self.num_output_placeholders = 0
         self.async_tokens_to_discard = 0
 
+        # Scheduler-side timing. local_execution_time tracks wall-clock time
+        # spent in this vLLM instance's scheduled model execution steps.
+        # remote_execution_time is carried through P/D kv_transfer_params.
+        # actual_execution_time is finalized as local + remote execution time.
+        self.scheduler_enqueue_time = time.monotonic()
+        self.local_execution_time = 0.0
+        self.remote_execution_time = self._get_remote_execution_time()
+        self.actual_execution_time = self.remote_execution_time
+        self.waiting_time = 0.0
+        self._execution_start_times: deque[float] = deque()
+
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
@@ -284,6 +295,47 @@ class Request:
         timestamp: float | None = None,
     ) -> None:
         self.events.append(EngineCoreEvent.new_event(event_type, timestamp))
+
+    def record_scheduler_enqueue(self, timestamp: float | None = None) -> None:
+        self.scheduler_enqueue_time = (
+            timestamp if timestamp is not None else time.monotonic()
+        )
+        self.local_execution_time = 0.0
+        self.remote_execution_time = self._get_remote_execution_time()
+        self.actual_execution_time = self.remote_execution_time
+        self.waiting_time = 0.0
+        self._execution_start_times.clear()
+
+    def record_execution_start(self, timestamp: float | None = None) -> None:
+        self._execution_start_times.append(
+            timestamp if timestamp is not None else time.monotonic()
+        )
+
+    def record_execution_end(self, timestamp: float | None = None) -> None:
+        if not self._execution_start_times:
+            return
+        end_time = timestamp if timestamp is not None else time.monotonic()
+        start_time = self._execution_start_times.popleft()
+        self.local_execution_time += max(0.0, end_time - start_time)
+        self.actual_execution_time = (
+            self.remote_execution_time + self.local_execution_time
+        )
+
+    def finalize_scheduler_timing(self, timestamp: float | None = None) -> None:
+        end_time = timestamp if timestamp is not None else time.monotonic()
+        while self._execution_start_times:
+            self.record_execution_end(end_time)
+        self.remote_execution_time = self._get_remote_execution_time()
+        self.actual_execution_time = (
+            self.remote_execution_time + self.local_execution_time
+        )
+        total_time = max(0.0, end_time - self.scheduler_enqueue_time)
+        self.waiting_time = max(0.0, total_time - self.actual_execution_time)
+
+    def _get_remote_execution_time(self) -> float:
+        if not self.kv_transfer_params:
+            return 0.0
+        return float(self.kv_transfer_params.get("remote_execution_time", 0.0))
 
     def take_events(self) -> list[EngineCoreEvent] | None:
         if not self.events:
