@@ -161,6 +161,10 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
+        # MLFQ 调度状态：level 越小优先级越高，tokens_in_level 记录当前层已消耗 token。
+        self.mlfq_level = 0
+        self.mlfq_tokens_in_level = 0
+
         # Multi-modal related
         self.mm_features = mm_features or []
 

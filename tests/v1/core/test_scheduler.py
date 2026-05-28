@@ -25,6 +25,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -1818,6 +1819,7 @@ def create_scheduler_with_priority(
     num_speculative_tokens: int | None = None,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
+    policy: str = "priority",
 ) -> Scheduler:
     """Create scheduler with priority policy enabled.
 
@@ -1848,7 +1850,7 @@ def create_scheduler_with_priority(
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=True,
         is_encoder_decoder=model_config.is_encoder_decoder,
-        policy="priority",  # Enable priority scheduling
+        policy=policy,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
@@ -2051,6 +2053,45 @@ def test_priority_scheduling_basic_ordering():
     # req_1 (priority 0), req_2 (priority 1), req_0 (priority 2)
     scheduled_req_ids = [req.req_id for req in output.scheduled_new_reqs]
     assert scheduled_req_ids == ["1", "2", "0"]
+
+
+def test_mlfq_request_queue_orders_by_level_then_fcfs():
+    requests = create_requests_with_priority(
+        num_requests=3,
+        priorities=[0, 0, 0],
+        arrival_times=[1.0, 2.0, 3.0],
+    )
+    requests[0].mlfq_level = 2
+    requests[1].mlfq_level = 0
+    requests[2].mlfq_level = 1
+
+    queue = create_request_queue(SchedulingPolicy.MLFQ)
+    for request in requests:
+        queue.add_request(request)
+
+    assert [queue.pop_request().request_id for _ in range(3)] == ["1", "2", "0"]
+
+
+def test_mlfq_demotes_after_token_quantum():
+    scheduler = create_scheduler_with_priority(policy="mlfq")
+    request = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[1.0],
+    )[0]
+
+    assert request.mlfq_level == 0
+    scheduler._update_mlfq_after_schedule(request, 1)
+    assert request.mlfq_level == 1
+    assert request.mlfq_tokens_in_level == 0
+
+    scheduler._update_mlfq_after_schedule(request, 1)
+    assert request.mlfq_level == 1
+    assert request.mlfq_tokens_in_level == 1
+
+    scheduler._update_mlfq_after_schedule(request, 1)
+    assert request.mlfq_level == 2
+    assert request.mlfq_tokens_in_level == 0
 
 
 def test_priority_scheduling_arrival_time_tiebreaker():

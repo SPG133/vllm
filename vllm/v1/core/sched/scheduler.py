@@ -43,6 +43,8 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
+    MLFQ_NUM_LEVELS,
+    MLFQ_QUANTA,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
@@ -362,6 +364,15 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_manager.new_step_starts()
 
         # First, schedule the RUNNING requests.
+        if self.policy == SchedulingPolicy.MLFQ:
+            # MLFQ 对 decode/running 请求也生效：高优先级层先获得本轮调度机会。
+            self.running.sort(
+                key=lambda r: (
+                    r.mlfq_level,
+                    r.arrival_time,
+                    r.request_id,
+                )
+            )
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
@@ -963,6 +974,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            if self.policy == SchedulingPolicy.MLFQ:
+                self._update_mlfq_after_schedule(request, num_scheduled_token)
             # 本轮被调度后，记录实际进入模型执行阶段的开始时间。
             request.record_execution_start()
             request.num_computed_tokens += num_scheduled_token
@@ -1629,13 +1642,34 @@ class Scheduler(SchedulerInterface):
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
-        # PRIORITY mode: compare queue heads when both queues are non-empty.
+        # PRIORITY/MLFQ mode: compare queue heads when both queues are non-empty.
         if self.waiting and self.skipped_waiting:
             waiting_req = self.waiting.peek_request()
             skipped_req = self.skipped_waiting.peek_request()
+            if self.policy == SchedulingPolicy.MLFQ:
+                return (
+                    self.waiting
+                    if self._mlfq_key(waiting_req) <= self._mlfq_key(skipped_req)
+                    else self.skipped_waiting
+                )
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting
 
         return self.waiting or self.skipped_waiting or None
+
+    @staticmethod
+    def _mlfq_key(request: Request) -> tuple[int, float, str]:
+        return request.mlfq_level, request.arrival_time, request.request_id
+
+    @staticmethod
+    def _update_mlfq_after_schedule(request: Request, num_scheduled_tokens: int) -> None:
+        request.mlfq_tokens_in_level += num_scheduled_tokens
+        quantum = MLFQ_QUANTA[request.mlfq_level]
+        if (
+            request.mlfq_tokens_in_level >= quantum
+            and request.mlfq_level < MLFQ_NUM_LEVELS - 1
+        ):
+            request.mlfq_level += 1
+            request.mlfq_tokens_in_level = 0
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""

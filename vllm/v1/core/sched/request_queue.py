@@ -15,6 +15,11 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    MLFQ = "mlfq"
+
+
+MLFQ_NUM_LEVELS = 3
+MLFQ_QUANTA = (1, 2, 4)
 
 
 class RequestQueue(ABC):
@@ -198,10 +203,80 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
+class MLFQRequestQueue(RequestQueue):
+    """Multi-level feedback queue.
+
+    Requests enter at level 0. The scheduler demotes requests as they consume
+    token quanta. Lower level numbers are served first; each level is FCFS.
+    """
+
+    def __init__(self) -> None:
+        self._queues: list[deque[Request]] = [
+            deque() for _ in range(MLFQ_NUM_LEVELS)
+        ]
+
+    @staticmethod
+    def _level(request: Request) -> int:
+        level = getattr(request, "mlfq_level", 0)
+        return min(max(level, 0), MLFQ_NUM_LEVELS - 1)
+
+    def add_request(self, request: Request) -> None:
+        self._queues[self._level(request)].append(request)
+
+    def pop_request(self) -> Request:
+        for queue in self._queues:
+            if queue:
+                return queue.popleft()
+        raise IndexError("pop from empty MLFQ")
+
+    def peek_request(self) -> Request:
+        for queue in self._queues:
+            if queue:
+                return queue[0]
+        raise IndexError("peek from empty MLFQ")
+
+    def prepend_request(self, request: Request) -> None:
+        self._queues[self._level(request)].appendleft(request)
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        for request in reversed(list(requests)):
+            self.prepend_request(request)
+
+    def remove_request(self, request: Request) -> None:
+        for queue in self._queues:
+            try:
+                queue.remove(request)
+                return
+            except ValueError:
+                pass
+        raise ValueError("request not in MLFQ")
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        requests_to_remove = requests if isinstance(requests, set) else set(requests)
+        for queue in self._queues:
+            filtered_requests = [
+                req for req in queue if req not in requests_to_remove
+            ]
+            queue.clear()
+            queue.extend(filtered_requests)
+
+    def __bool__(self) -> bool:
+        return any(self._queues)
+
+    def __len__(self) -> int:
+        return sum(len(queue) for queue in self._queues)
+
+    def __iter__(self) -> Iterator[Request]:
+        for queue in self._queues:
+            yield from queue
+
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
+    elif policy == SchedulingPolicy.MLFQ:
+        return MLFQRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
     else:
