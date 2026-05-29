@@ -162,8 +162,11 @@ class Request:
         self.cache_salt: str | None = cache_salt
 
         # MLFQ 调度状态：level 越小优先级越高，tokens_in_level 记录当前层已消耗 token。
+        # last_queued_time/starve_time 用来实现论文算法里的 starveTime >= alpha 提升。
         self.mlfq_level = 0
         self.mlfq_tokens_in_level = 0
+        self.mlfq_last_queued_time: float | None = None
+        self.mlfq_starve_time = 0.0
 
         # Multi-modal related
         self.mm_features = mm_features or []
@@ -378,6 +381,37 @@ class Request:
         )
         total_time = max(0.0, end_time - self.scheduler_enqueue_time)
         self.waiting_time = max(0.0, total_time - self.actual_execution_time)
+
+    def record_mlfq_enqueue(self, timestamp: float | None = None) -> None:
+        # 请求进入 MLFQ 等待队列时记录时间点，后续用它累计饥饿时间。
+        self.mlfq_last_queued_time = (
+            timestamp if timestamp is not None else time.monotonic()
+        )
+
+    def record_mlfq_dequeue(self, timestamp: float | None = None) -> None:
+        # 请求离开等待队列进入执行态时，停止累计本轮排队饥饿时间。
+        if self.mlfq_last_queued_time is None:
+            return
+        now = timestamp if timestamp is not None else time.monotonic()
+        self.mlfq_starve_time += max(0.0, now - self.mlfq_last_queued_time)
+        self.mlfq_last_queued_time = None
+
+    def refresh_mlfq_starve_time(self, timestamp: float | None = None) -> float:
+        # 调度器每轮检查等待队列时刷新 starveTime，模拟算法中的 job.starveTime。
+        if self.mlfq_last_queued_time is None:
+            return self.mlfq_starve_time
+        now = timestamp if timestamp is not None else time.monotonic()
+        self.mlfq_starve_time += max(0.0, now - self.mlfq_last_queued_time)
+        self.mlfq_last_queued_time = now
+        return self.mlfq_starve_time
+
+    def reset_mlfq_starvation(self, timestamp: float | None = None) -> None:
+        # 饥饿任务被提升到最高优先级后清零，避免每轮都重复提升。
+        self.mlfq_starve_time = 0.0
+        if self.mlfq_last_queued_time is not None:
+            self.mlfq_last_queued_time = (
+                timestamp if timestamp is not None else time.monotonic()
+            )
 
     def _get_prefill_execution_time(self) -> float:
         # PD 分离下，D 端 request 会携带 P 端已经花掉的执行时间。

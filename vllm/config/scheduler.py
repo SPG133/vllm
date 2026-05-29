@@ -113,8 +113,10 @@ class SchedulerConfig:
       of arrival.
     - "priority" means requests are handled based on given priority (lower
       value means earlier handling) and time of arrival deciding any ties).
-    - "mlfq" means multi-level feedback queue, i.e. requests start in the
-      highest-priority queue and move down after consuming token quanta."""
+    - "mlfq" means skip-join multi-level feedback queue: requests join an
+      initial queue based on estimated next-iteration work, move down after
+      consuming token quanta, and move back to the highest-priority queue when
+      starved."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

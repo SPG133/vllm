@@ -45,6 +45,8 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import (
     MLFQ_NUM_LEVELS,
     MLFQ_QUANTA,
+    MLFQ_SKIP_JOIN_THRESHOLDS,
+    MLFQ_STARVATION_SECONDS,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
@@ -555,6 +557,10 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            if self.policy == SchedulingPolicy.MLFQ:
+                # Skip-Join MLFQ 的 promote-starved-jobs 阶段：
+                # 每轮正式取等待任务前，先把 starveTime >= alpha 的任务提升回 Q1。
+                self._promote_starved_mlfq_requests(scheduled_timestamp)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -1633,6 +1639,8 @@ class Scheduler(SchedulerInterface):
         )
 
     def _enqueue_waiting_request(self, request: Request) -> None:
+        if self.policy == SchedulingPolicy.MLFQ:
+            self._assign_mlfq_level_on_enqueue(request)
         if self._is_blocked_waiting_status(request.status):
             self.skipped_waiting.add_request(request)
         else:
@@ -1660,8 +1668,68 @@ class Scheduler(SchedulerInterface):
     def _mlfq_key(request: Request) -> tuple[int, float, str]:
         return request.mlfq_level, request.arrival_time, request.request_id
 
+    def _assign_mlfq_level_on_enqueue(self, request: Request) -> None:
+        # Skip-join newly arrived jobs:
+        # 论文里的 init_time = P.getNextIterTime(job)，这里用下一轮预计计算 token 数近似。
+        # qi 取每层 quantum 阈值；较短的 decode 步通常进入 Q1，较长 prefill 块跳到低优先级队列。
+        next_iter_tokens = self._estimate_mlfq_next_iter_tokens(request)
+        request.mlfq_level = self._select_mlfq_level_for_next_iter(next_iter_tokens)
+        request.mlfq_tokens_in_level = 0
+        request.reset_mlfq_starvation()
+
+    def _promote_starved_mlfq_requests(self, timestamp: float) -> None:
+        # Promote starved jobs: 等待时间超过 alpha 的任务提升到 Q1。
+        # 这里同时处理 waiting 和 skipped_waiting，因为 PD 的 D 端请求可能在等远端 KV。
+        self._promote_starved_mlfq_requests_in_queue(self.waiting, timestamp)
+        self._promote_starved_mlfq_requests_in_queue(self.skipped_waiting, timestamp)
+
+    @staticmethod
+    def _promote_starved_mlfq_requests_in_queue(
+        queue: RequestQueue,
+        timestamp: float,
+    ) -> None:
+        if not queue:
+            return
+        starved_requests = []
+        for request in queue:
+            if request.mlfq_level == 0:
+                request.refresh_mlfq_starve_time(timestamp)
+                continue
+            if request.refresh_mlfq_starve_time(timestamp) >= MLFQ_STARVATION_SECONDS:
+                starved_requests.append(request)
+        if not starved_requests:
+            return
+        queue.remove_requests(starved_requests)
+        for request in starved_requests:
+            request.mlfq_level = 0
+            request.mlfq_tokens_in_level = 0
+            request.reset_mlfq_starvation(timestamp)
+            queue.add_request(request)
+
+    @staticmethod
+    def _select_mlfq_level_for_next_iter(next_iter_tokens: int) -> int:
+        for level, threshold in enumerate(MLFQ_SKIP_JOIN_THRESHOLDS):
+            if next_iter_tokens <= threshold:
+                return level
+        return MLFQ_NUM_LEVELS - 1
+
+    def _estimate_mlfq_next_iter_tokens(self, request: Request) -> int:
+        # 已经进入 decode 的请求下一轮通常只生成 1 个 token；prefill/chunked prefill
+        # 则按尚未计算的 prompt/token 数估计，并受 long_prefill_token_threshold 限制。
+        remaining_tokens = max(
+            1,
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens,
+        )
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        if 0 < threshold < remaining_tokens:
+            remaining_tokens = threshold
+        return remaining_tokens
+
     @staticmethod
     def _update_mlfq_after_schedule(request: Request, num_scheduled_tokens: int) -> None:
+        # Demote jobs: 当前层消耗的 token 数达到 quantum 后，降到下一层。
         request.mlfq_tokens_in_level += num_scheduled_tokens
         quantum = MLFQ_QUANTA[request.mlfq_level]
         if (

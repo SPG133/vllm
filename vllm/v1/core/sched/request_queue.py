@@ -20,6 +20,14 @@ class SchedulingPolicy(Enum):
 
 MLFQ_NUM_LEVELS = 3
 MLFQ_QUANTA = (1, 2, 4)
+# Skip-Join MLFQ 中 qi 的工程化阈值：按“下一轮预计 token 数”选择初始队列。
+# 例如 1 token 的 decode 步进入 Q1，2 token 左右的小块进入 Q2，更大的块进入 Q3。
+# 举例：decode 请求下一步通常只算 1 个 token，所以 skip-join 到 Q1；
+# 长 prefill/chunked prefill 如果下一轮预计要算 4 个 token，则直接进入 Q3，
+# 避免大块 prefill 把短 decode 步堵在最高优先级队列里。
+MLFQ_SKIP_JOIN_THRESHOLDS = MLFQ_QUANTA
+# Skip-Join MLFQ 中的 alpha：低优先级请求累计等待超过该时间后提升到 Q1。
+MLFQ_STARVATION_SECONDS = 1.0
 
 
 class RequestQueue(ABC):
@@ -204,10 +212,11 @@ class PriorityRequestQueue(RequestQueue):
 
 
 class MLFQRequestQueue(RequestQueue):
-    """Multi-level feedback queue.
+    """Skip-Join multi-level feedback queue.
 
-    Requests enter at level 0. The scheduler demotes requests as they consume
-    token quanta. Lower level numbers are served first; each level is FCFS.
+    新请求不固定进入 Q1，而是根据下一轮预计计算量 skip-join 到合适队列；
+    请求消耗完当前层 quantum 后降级；等待过久的请求会提升回 Q1。
+    Lower level numbers are served first; each level is FCFS.
     """
 
     def __init__(self) -> None:
@@ -221,12 +230,15 @@ class MLFQRequestQueue(RequestQueue):
         return min(max(level, 0), MLFQ_NUM_LEVELS - 1)
 
     def add_request(self, request: Request) -> None:
+        request.record_mlfq_enqueue()
         self._queues[self._level(request)].append(request)
 
     def pop_request(self) -> Request:
         for queue in self._queues:
             if queue:
-                return queue.popleft()
+                request = queue.popleft()
+                request.record_mlfq_dequeue()
+                return request
         raise IndexError("pop from empty MLFQ")
 
     def peek_request(self) -> Request:
@@ -236,6 +248,7 @@ class MLFQRequestQueue(RequestQueue):
         raise IndexError("peek from empty MLFQ")
 
     def prepend_request(self, request: Request) -> None:
+        request.record_mlfq_enqueue()
         self._queues[self._level(request)].appendleft(request)
 
     def prepend_requests(self, requests: RequestQueue) -> None:
@@ -246,6 +259,7 @@ class MLFQRequestQueue(RequestQueue):
         for queue in self._queues:
             try:
                 queue.remove(request)
+                request.record_mlfq_dequeue()
                 return
             except ValueError:
                 pass
@@ -254,9 +268,12 @@ class MLFQRequestQueue(RequestQueue):
     def remove_requests(self, requests: Iterable[Request]) -> None:
         requests_to_remove = requests if isinstance(requests, set) else set(requests)
         for queue in self._queues:
-            filtered_requests = [
-                req for req in queue if req not in requests_to_remove
-            ]
+            filtered_requests = []
+            for req in queue:
+                if req in requests_to_remove:
+                    req.record_mlfq_dequeue()
+                else:
+                    filtered_requests.append(req)
             queue.clear()
             queue.extend(filtered_requests)
 

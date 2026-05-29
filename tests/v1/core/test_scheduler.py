@@ -25,7 +25,11 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.request_queue import (
+    MLFQ_STARVATION_SECONDS,
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import FinishReason
 from vllm.v1.kv_cache_interface import (
@@ -2092,6 +2096,51 @@ def test_mlfq_demotes_after_token_quantum():
     scheduler._update_mlfq_after_schedule(request, 1)
     assert request.mlfq_level == 2
     assert request.mlfq_tokens_in_level == 0
+
+
+def test_skip_join_mlfq_places_long_prefill_in_lower_queue():
+    scheduler = create_scheduler_with_priority(
+        policy="mlfq",
+        long_prefill_token_threshold=4,
+    )
+    requests = create_requests_with_priority(
+        num_requests=2,
+        priorities=[0, 0],
+        arrival_times=[1.0, 2.0],
+        num_tokens=10,
+    )
+
+    for request in requests:
+        scheduler.add_request(request)
+
+    # Skip-Join：预计下一轮要算 4 个 token，对应第三层队列（Q3）。
+    assert [request.mlfq_level for request in requests] == [2, 2]
+    assert [scheduler.waiting.pop_request().request_id for _ in range(2)] == [
+        "0",
+        "1",
+    ]
+
+
+def test_mlfq_promotes_starved_request_to_top_queue():
+    scheduler = create_scheduler_with_priority(policy="mlfq")
+    request = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[1.0],
+    )[0]
+    scheduler.add_request(request)
+    request.mlfq_level = 2
+    request.mlfq_last_queued_time = 0.0
+
+    scheduler._promote_starved_mlfq_requests(
+        timestamp=MLFQ_STARVATION_SECONDS + 0.1
+    )
+
+    promoted_request = scheduler.waiting.pop_request()
+    assert promoted_request is request
+    assert request.mlfq_level == 0
+    assert request.mlfq_tokens_in_level == 0
+    assert request.mlfq_starve_time == 0.0
 
 
 def test_priority_scheduling_arrival_time_tiebreaker():
